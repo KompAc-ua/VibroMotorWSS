@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
+#include "cJSON.h"
 
 #include "esp_log.h"
 #include "esp_https_server.h"
@@ -30,10 +31,10 @@ extern const uint8_t key_start[]  asm("_binary_key_pem_start");
 extern const uint8_t key_end[]    asm("_binary_key_pem_end");
 
 #define LEDC_MODE           LEDC_HIGH_SPEED_MODE
-#define LEDC_TIMER          LEDC_TIMER_0
 #define LEDC_CHANNEL_LED    LEDC_CHANNEL_0
 #define LEDC_CHANNEL_MOTOR1 LEDC_CHANNEL_1
 #define LEDC_CHANNEL_MOTOR2 LEDC_CHANNEL_2
+#define LEDC_TIMER          LEDC_TIMER_0
 
 #define LED_GPIO            2
 #define MOTOR1_PWM_GPIO     13
@@ -41,7 +42,9 @@ extern const uint8_t key_end[]    asm("_binary_key_pem_end");
 #define MOTOR2_PWM_GPIO     26
 #define MOTOR2_IN4_GPIO     27
 
-static int bri = 0, buf = 0;
+// Переменные для хранения значений яркости/скорости
+static int led_bri = 0, motor1_bri = 0, motor2_bri = 0;
+static int buf = 0; // Буфер для числового сообщения
 static bool client_connected = false, new_message_received = false;
 
 static void wifi_event_handler(void* arg, esp_event_base_t event_base,
@@ -117,60 +120,102 @@ void pwm_init(void) {
 }
 
 esp_err_t ws_handler(httpd_req_t *req) {
-    // Если это начальный GET-запрос — происходит рукопожатие WebSocket
     if (req->method == HTTP_GET) {
-        client_connected = true;  // Отмечаем, что клиент подключился
-        ESP_LOGI(TAG, "WS handshake OK");  // Логируем успешное установление соединения
+        client_connected = true;
+        ESP_LOGI(TAG, "WS handshake OK");
         return ESP_OK;
     }
 
-    // Подготавливаем структуру для приёма WebSocket фрейма
     httpd_ws_frame_t ws_pkt = {0};
-    uint8_t buf_ws[128] = {0};     // Буфер для входящих данных
-    ws_pkt.payload = buf_ws;       // Указываем, куда записывать данные
+    uint8_t buf_ws[128] = {0};
+    ws_pkt.payload = buf_ws;
 
-    // Пытаемся получить фрейм от клиента (блокирующий вызов)
     esp_err_t ret = httpd_ws_recv_frame(req, &ws_pkt, sizeof(buf_ws));
     if (ret != ESP_OK) {
-        // Если произошла ошибка при приёме фрейма (включая отключение клиента)
-        ESP_LOGI(TAG, "WS recv_frame error: %s", esp_err_to_name(ret));  // Логируем ошибку
-        client_connected = false;  // Отмечаем, что клиент отключился
-        bri = 0;                  // Сбрасываем яркость
-        ESP_LOGI(TAG, "WS client disconnected or error");  // Логируем факт отключения
-        return ESP_OK;            // Возвращаем OK, чтобы сервер не ругался
+        ESP_LOGI(TAG, "WS recv_frame error: %s", esp_err_to_name(ret));
+        client_connected = false;
+        led_bri = motor1_bri = motor2_bri = 0;
+        ESP_LOGI(TAG, "WS client disconnected or error");
+        return ESP_OK;
     }
 
-    // Обрабатываем тип полученного фрейма
     if (ws_pkt.type == HTTPD_WS_TYPE_TEXT && ws_pkt.len > 0) {
-        // Если это текстовое сообщение и оно не пустое
-        char *endptr;
-        long val = strtol((char*)ws_pkt.payload, &endptr, 10);  // Конвертируем строку в число
+        buf_ws[ws_pkt.len] = '\0'; // Завершаем строку
+        cJSON *json = cJSON_Parse((char*)buf_ws);
+        if (json != NULL) {
+            // Проверяем, является ли сообщение JSON-объектом
+            if (cJSON_IsObject(json)) {
+                cJSON *led = cJSON_GetObjectItem(json, "led");
+                cJSON *motor1 = cJSON_GetObjectItem(json, "motor1");
+                cJSON *motor2 = cJSON_GetObjectItem(json, "motor2");
 
-        // Проверяем, что весь буфер — валидное число в диапазоне 0..255
-        if (*endptr == '\0' && val >= 0 && val <= 255) {
-            buf = (int)val;           // Запоминаем значение в буфер
-            new_message_received = true;  // Помечаем, что пришло новое сообщение
-            ESP_LOGI(TAG, "Valid payload: %ld", val);  // Логируем корректное значение
+                // Обработка значений, если они присутствуют и являются числами
+                if (led && cJSON_IsNumber(led)) {
+                    int val = led->valueint;
+                    if (val >= 0 && val <= 255) {
+                        led_bri = val;
+                        new_message_received = true;
+                        ESP_LOGI(TAG, "JSON: led = %d", val);
+                    } else {
+                        ESP_LOGW(TAG, "JSON: Invalid led value: %d", val);
+                    }
+                }
+                if (motor1 && cJSON_IsNumber(motor1)) {
+                    int val = motor1->valueint;
+                    if (val >= 0 && val <= 255) {
+                        motor1_bri = val;
+                        new_message_received = true;
+                        ESP_LOGI(TAG, "JSON: motor1 = %d", val);
+                    } else {
+                        ESP_LOGW(TAG, "JSON: Invalid motor1 value: %d", val);
+                    }
+                }
+                if (motor2 && cJSON_IsNumber(motor2)) {
+                    int val = motor2->valueint;
+                    if (val >= 0 && val <= 255) {
+                        motor2_bri = val;
+                        new_message_received = true;
+                        ESP_LOGI(TAG, "JSON: motor2 = %d", val);
+                    } else {
+                        ESP_LOGW(TAG, "JSON: Invalid motor2 value: %d", val);
+                    }
+                }
+            } else {
+                // Для обратной совместимости: пробуем интерпретировать как строку с числом
+                char *endptr;
+                long val = strtol((char*)ws_pkt.payload, &endptr, 10);
+                if (*endptr == '\0' && val >= 0 && val <= 255) {
+                    buf = (int)val;
+                    new_message_received = true;
+                    ESP_LOGI(TAG, "Valid numeric payload: %ld", val);
+                } else {
+                    ESP_LOGW(TAG, "Bad payload: %.*s", ws_pkt.len, ws_pkt.payload);
+                }
+            }
+            cJSON_Delete(json);
         } else {
-            // Если данные невалидные — выводим предупреждение
-            ESP_LOGW(TAG, "Bad payload: %.*s", ws_pkt.len, ws_pkt.payload);
+            // Если не JSON, пробуем как строку с числом
+            char *endptr;
+            long val = strtol((char*)ws_pkt.payload, &endptr, 10);
+            if (*endptr == '\0' && val >= 0 && val <= 255) {
+                buf = (int)val;
+                new_message_received = true;
+                ESP_LOGI(TAG, "Valid numeric payload: %ld", val);
+            } else {
+                ESP_LOGW(TAG, "Bad payload: %.*s", ws_pkt.len, ws_pkt.payload);
+            }
         }
     } else if (ws_pkt.type == HTTPD_WS_TYPE_PING) {
-        // Если пришёл PING — отвечаем PONG для поддержания соединения
         ws_pkt.type = HTTPD_WS_TYPE_PONG;
         httpd_ws_send_frame_async(req->handle, httpd_req_to_sockfd(req), &ws_pkt);
     } else if (ws_pkt.type == HTTPD_WS_TYPE_CLOSE) {
-        // Если пришёл фрейм закрытия — клиент намеренно отключился
-        client_connected = false;  // Отмечаем отключение клиента
-        bri = 0;                   // Сбрасываем яркость
-        ESP_LOGI(TAG, "WS client sent CLOSE frame");  // Логируем закрытие соединения
+        client_connected = false;
+        led_bri = motor1_bri = motor2_bri = 0;
+        ESP_LOGI(TAG, "WS client sent CLOSE frame");
     }
 
     return ESP_OK;
 }
-
-
-
 
 httpd_handle_t start_wss_server(void) {
     size_t cert_len = cert_end - cert_start;
@@ -213,33 +258,54 @@ httpd_handle_t start_wss_server(void) {
 }
 
 void control_task(void *pv) {
-    int motor2_bri = 0;
     while (1) {
-        if (new_message_received) {
-            bri = fmaxf(bri, buf);
+        if (new_message_received && buf != 0) {
+            // Если пришло числовое сообщение, применяем его ко всем устройствам
+            // Только если новое значение больше текущего
+            if (buf > led_bri) {
+                led_bri = buf;
+                ESP_LOGI(TAG, "Updated led_bri to %d (numeric)", led_bri);
+            }
+            if (buf > motor1_bri) {
+                motor1_bri = buf;
+                ESP_LOGI(TAG, "Updated motor1_bri to %d (numeric)", motor1_bri);
+            }
+            if (buf > motor2_bri) {
+                motor2_bri = buf;
+                ESP_LOGI(TAG, "Updated motor2_bri to %d (numeric)", motor2_bri);
+            }
+            buf = 0; // Сбрасываем буфер
             new_message_received = false;
-            buf = 0;
         } else if (client_connected) {
-            bri -= bri * 0.03f;
-        } else {
-            bri = 0;
-        }
-        bri = roundf(fminf(fmaxf(bri, 0), 255));
-        uint32_t duty = bri;
+            // Плавное затухание, если клиент подключен, но новых сообщений нет
+            int temp_led = led_bri - led_bri * 0.03f;
+            int temp_motor1 = motor1_bri - motor1_bri * 0.03f;
+            int temp_motor2 = motor2_bri - motor2_bri * 0.03f;
 
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_LED, duty));
+            // Принудительно устанавливаем 0, если значение становится меньше 1
+            led_bri = temp_led < 1.0f ? 0 : roundf(temp_led);
+            motor1_bri = temp_motor1 < 1.0f ? 0 : roundf(temp_motor1);
+            motor2_bri = temp_motor2 < 1.0f ? 0 : roundf(temp_motor2);
+        } else {
+            // Сбрасываем все значения, если клиент отключен
+            led_bri = motor1_bri = motor2_bri = 0;
+        }
+
+        // Применяем значения к каналам PWM
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_LED, led_bri));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_LED));
 
-        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_MOTOR1, duty));
+        ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_MOTOR1, motor1_bri));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_MOTOR1));
         gpio_set_level(MOTOR1_IN4_GPIO, 0);
 
-        motor2_bri = bri > 150 ? bri : fmaxf(motor2_bri - motor2_bri * 0.03f, 0);
         ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL_MOTOR2, motor2_bri));
         ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL_MOTOR2));
         gpio_set_level(MOTOR2_IN4_GPIO, 0);
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        vTaskDelay(pdMS_TO_TICKS
+
+(10));
     }
 }
 
@@ -254,7 +320,7 @@ void app_main(void) {
     pwm_init();
     wifi_init();
 
-    ESP_LOGI(TAG, "Waiting for Wi‑Fi connection...");
+    ESP_LOGI(TAG, "Waiting for Wi-Fi connection...");
     xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT, false, true, portMAX_DELAY);
 
     httpd_handle_t server = start_wss_server();
